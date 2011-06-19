@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Proc-JobQueue
-version:            0.4
+version:            0.501
 abstract:           Jobqueue with dependency graph
 author:
     - David Muir Sharnoff <muir@idiom.org>
@@ -18,17 +18,20 @@ requires:
     File::Slurp::Remote::BrokenDNS:  0
     File::Temp:           0
     Hash::Util:           0
+    List::MoreUtils:      0
     Object::Dependency:   0
     Proc::Background:     0
-    RPC::ToWorker:        0
+    RPC::ToWorker:        0.5
     Scalar::Util:         0
     Tie::Function::Examples:  0
     Time::HiRes:          0
+resources:
+    repository:  http://github.com/muir/Proc-JobQueue
 no_index:
     directory:
         - t
         - inc
-generated_by:       ExtUtils::MakeMaker version 6.55_02
+generated_by:       ExtUtils::MakeMaker version 6.56
 meta-spec:
     url:      http://module-build.sourceforge.net/META-spec-v1.4.html
     version:  1.4

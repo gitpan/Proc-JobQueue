@@ -1,0 +1,8 @@
+
+=== 2011/06/18	0.501
+
+Proc::JobQueue::Move now deletes the orginal file when
+moving files to remote hosts.
+
+Proc::JobQueue::Sequence rewritten
+
