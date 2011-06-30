@@ -7,12 +7,13 @@ use warnings;
 use Time::HiRes qw(sleep);
 use Sys::Hostname;
 use Carp qw(confess);
-use Hash::Util qw(lock_keys);
+use Hash::Util qw(lock_keys unlock_keys);
 use Time::HiRes qw(time);
 use Module::Load;
+use Object::Dependency;
 require Exporter;
 
-our $VERSION = 0.602;
+our $VERSION = 0.901;
 our $debug ||= 0;
 our $status_frequency ||= 2;
 our $host_canonicalizer ||= 'File::Slurp::Remote::CanonicalHostnames';
@@ -35,11 +36,11 @@ sub addhost
 	} else {
 		$hr = $queue->{status}{$host} = {
 			name		=> $host,
-			running		=> {},
-			queue		=> {},
 			jobs_per_host	=> $queue->{jobs_per_host},
 			in_startmore	=> 0,
 			%params,
+			running		=> {},
+			queue		=> {},
 		};
 	}
 	$queue->set_readiness($host);
@@ -62,15 +63,17 @@ sub new
 {
 	my ($pkg, %params) = @_;
 	my $queue = bless {
-		host_overload	=> 120,
-		host_is_over	=> 0,
-		jobnum		=> 1000,
-		jobs_per_host	=> 4,
-		queue		=> {},
-		status		=> {},
-		ready_hosts	=> {},
-		hold_all	=> 0,
-		hosts		=> [ my_hostname() ],
+		dependency_graph	=> undef,
+		startmore_in_progress	=> undef,
+		host_overload		=> 120,
+		host_is_over		=> 0,
+		jobnum			=> 1000,
+		jobs_per_host		=> 4,
+		queue			=> {},
+		status			=> {},
+		ready_hosts		=> {},
+		hold_all		=> 0,
+		hosts			=> [ my_hostname() ],
 		%params,
 	}, $pkg;
 	$queue->addhost($_) for @{$queue->{hosts}};
@@ -105,11 +108,88 @@ sub add
 	}
 
 	$q->{$jobnum} = $job;
+
+	$job->{dependency_graph} = $queue->{dependency_graph}; # TODO: do this with a method
+
 	$job->queue($queue);
 	$queue->startmore;
 }
 
+# this looks at the dependency queue.  startmore_jobs looks at the 
+# at the jobs queue.
 sub startmore
+{
+	my ($job_queue) = shift;
+
+	if ($job_queue->{startmore_in_progress}) {
+		print STDERR "Re-entry to startmore prevented\n" if $debug;
+		$job_queue->{startmore_in_progress}++;
+		return 0;
+	}
+	$job_queue->{startmore_in_progress} = 2;
+
+	my $dependency_graph = $job_queue->{dependency_graph};
+
+	my $stuff_started = 0;
+
+	my $jq_done;
+
+	print STDERR "looking for more depenency graph items to queue up\n" if $debug;
+	eval {
+		$job_queue->checkjobs();
+
+		while ($job_queue->{startmore_in_progress} > 1) {
+			$job_queue->{startmore_in_progress} = 1;
+			if ($dependency_graph) {
+				while (my @runnable = $dependency_graph->independent(lock => 1)) {
+					$stuff_started++;
+					for my $task (@runnable) {
+						print "Queuing $task->{desc}\n" if $debug;
+						if ($task->can('run_dependency_task')) {
+							$job_queue->{startmore_in_progress}++ if $task->run_dependency_task($dependency_graph);
+						} elsif ($task->isa('Proc::JobQueue::Job')) {
+							$job_queue->add($task, $task->{force_host});
+						} else {
+							die "don't know how to handle $task";
+						}
+					}
+				}
+			}
+
+			$jq_done = $job_queue->startmore_jobs();
+
+			redo if $job_queue->{startmore_in_progress} > 1;
+		}
+	};
+	if ($@) {
+		$job_queue->suicide();
+	};
+
+	$job_queue->{startmore_in_progress} = 0;
+
+	return $jq_done unless $dependency_graph;
+
+	if ($jq_done && $dependency_graph->alldone) {
+		print STDERR "Nothing more to do\n";
+		$job_queue->unloop();
+		return 1;
+	} elsif ($jq_done && ! $stuff_started) {
+		if (keys %{$dependency_graph->{stuck}}) {
+			print STDERR "All runnable jobs are done, remaining dependencies are stuck:\n";
+			for my $o (values %{$dependency_graph->{stuck}}) {
+				printf "\t%s\n", $dependency_graph->desc($o);
+			}
+			$job_queue->unloop();
+			return 1;
+		} else {
+			print STDERR "Job queue is empty, but dependency graph doesn't think there is any work to be done!\n";
+			$dependency_graph->dump_graph();
+		}
+	}
+	return 0;
+}
+
+sub startmore_jobs
 {
 	my ($queue) = @_;
 	return 0 if $queue->{hold_all};
@@ -159,6 +239,17 @@ sub startmore
 	return $queue->alldone();
 }
 
+sub suicide 
+{
+	print STDERR "DIE DIE DIE DIE DIE (DT2): $@";
+	# exit 1; hangs!
+	POSIX::_exit(1);
+}
+
+# a hook for EventQueue
+sub unloop { }
+
+
 sub startjob
 {
 	my ($queue, $host, $jobnum, $job) = @_;
@@ -198,23 +289,39 @@ sub checkjobs
 
 sub jobdone
 {
-	my ($queue, $job, $startmore, @exit_code) = @_;
+	my ($job_queue, $job, $do_startmore, @exit_code) = @_;
+	if ($job->{dependency_graph}) {
+		if ($exit_code[0]) {
+			print STDERR "Things dependent on $job->{desc} will never run: @exit_code\n";
+			$job->{dependency_graph}->stuck_dependency($job, "exit @exit_code");
+		} else {
+			$job->{dependency_graph}->remove_dependency($job);
+		}
+		$job->{dependency_graph} = undef;
+		# unlock_keys(%$job);
+		# $job->{this_is_finished} = 1;
+		# lock_keys(%$job);
+	}
+	$job_queue->job_part_finished($job, $do_startmore, @exit_code);
+}
 
-	$startmore = 1 unless defined $startmore;
+sub job_part_finished
+{
+	my ($job_queue, $job, $do_startmore, @exit_code) = @_;
+	$do_startmore = 1 unless defined $do_startmore;
 
 	my $host = $job->host;
 	my $jobnum = $job->jobnum;
 
 	print STDERR "# job $jobnum $job->{desc} on $host is done\n" if $debug > 5;
 
-	my $hr = $queue->{status}{$host} or confess;
+	my $hr = $job_queue->{status}{$host} or confess;
 	delete $hr->{running}{$jobnum} or confess;
 
-	$queue->set_readiness($host);
+	$job_queue->set_readiness($host);
 
-	$queue->startmore() if $startmore;
+	$job_queue->startmore() if $do_startmore;
 }
-
 
 sub alldone
 {
@@ -252,6 +359,14 @@ sub status
 			print STDERR "\t\tRunning: $job->{jobnum} $job->{desc}\n";
 		}
 	}
+	my $dg = $queue->{dependency_graph};
+	printf "Dependency Graph items: %d independent (%d locked %d active), %d total, alldone=%s\n",
+		scalar(keys(%{$dg->{independent}})),
+		scalar(grep { $_->{dg_lock} } values %{$dg->{independent}}),
+		scalar(grep { $_->{dg_active} } values %{$dg->{independent}}),
+		scalar(keys(%{$dg->{addrmap}})),
+		$dg->alldone
+		if $dg;
 }
 
 my $canonicalizer;
@@ -281,6 +396,18 @@ sub is_remote_host
 	return my_hostname() ne canonicalize($host);
 }
 
+sub graph
+{
+	my $queue = shift;
+	if (@_) {
+		die "a dependency graph was already set" if $queue->{dependency_graph};
+		$queue->{dependency_graph} = shift;
+	} elsif (! $queue->{dependency_graph}) {
+		$queue->{dependency_graph} = Object::Dependency->new();
+	}
+	return $queue->{dependency_graph};
+}
+
 
 1;
 
@@ -288,7 +415,7 @@ __END__
 
 =head1 NAME
 
- Proc::JobQueue - generic job queue base class
+ Proc::JobQueue - job queue with dependencies, base class
 
 =head1 SYNOPSIS
 
@@ -320,9 +447,17 @@ __END__
 Generic queue of "jobs".   Most likely to be subclassed
 for different situations.  Jobs are registered.  Hosts are
 registered.  Jobs may or may not be tied to particular hosts.
-Jobs are started on hosts.   
+Jobs are started on hosts.  Jobs may or may not have 
+dependencies on each other.
 
-Jobs are started with:
+Proc::JobQueue does not start jobs on its own: it needs something
+to call C<startmore()> every now and then.   Two subsclasses
+provide this complete Proc::JobQueue: 
+L<Proc::JobQueue::EventQueue> which provides an event-based
+framework using L<IO::Event> and L<Proc::JobQueue::BackgroundQueue>
+which provides a simple loop-until-all-the-jobs-are-done construct.
+
+From the jobs point of view, it will be started with:
 
   $job->jobnum($jobnum);
   $jobnum = $job->jobnum();
@@ -334,9 +469,17 @@ When jobs complete, they must call:
 
   $queue->jobdone($job, $do_startmore, @exit_code);
 
-Hosts are added with:
+Jobs are run on hosts which must be added with:
 
-  $queue->addhost($host, name => $hostname, jobs_per_host => $number_to_run_on_this_host)
+  $queue->addhost($hostname, jobs_per_host => $number_to_run_on_this_host_at_one_time)
+
+Jobs can be 
+shell commands (L<Proc::JobQueue::Command>), 
+a sequence of other jobs (L<Proc::JobQueue::Sequence>),
+some standard file operations (L<Proc::JobQueue::Move>, L<Proc::JobQueue::Sort>),
+custom cubclasses of the base job class (L<Proc::JobQueue::Job>),
+arbitrary perl code (L<Proc::JobQueue::DependencyJob>, L<Proc::JobQueue::Task>),
+or arbitary perl code pushed to a remote system to run (L<Proc::JobQueue::RemoteDependencyJob>).
 
 =head1 CONSTRUCTION
 
@@ -361,6 +504,11 @@ This is the starting job number.   Job numbers are sometimes displayed.  They in
 
 If true, prevent any jobs from starting until C<$queue-E<gt>hold(0)> is called.
 
+=item dependency_graph (default undef)
+
+A dependency graph to track jobs and tasks that have dependencies and are not
+yet ready to run because of their dependencies. 
+
 =back
 
 =head1 METHODS
@@ -371,26 +519,22 @@ If true, prevent any jobs from starting until C<$queue-E<gt>hold(0)> is called.
 
 Adjusts the same parameters that can be set with C<new>.
 
-=item addhost($host, %params)
+=item addhost($hostname, %params)
 
 Register a new host.  Parameters are:
 
 =over 
 
-=item name
-
-The hostname
-
 =item jobs_per_host
 
 The number of jobs that can be run at once on this host.  This defaults
-to the jobs_per_host parameter of the C<$queue>.
+to the C<jobs_per_host> parameter of the C<$queue>.
 
 =back
 
 =item add($job, $host)
 
-Add a job object to the queue.   The job object must be 
+Add a job object to the runnable queue.   The job object must be 
 a L<Proc::JobQueue::Job> or subclass of L<Proc::JobQueue::Job>.  
 The C<$host> parameter is optional: if not set, the job can be run on any host.
 
@@ -406,11 +550,30 @@ When the job complets, it must call:
 
   $queue->jobdone($job, $do_startmore, @exit_code);
 
+Jobs added this way must be ready to run with no dependencies on other jobs.
+Jobs and tasks that have dependencies should be added with:
+
+  $queue->graph->add($job);
+
+=item graph([Object::Dependency->new()])
+
+Get or set the dependency graph used to track jobs and tasks that have
+dependencies.  The dependency graph is an L<Object::Dependency> object
+(or at least something that implements the same API).  Items in the
+dependency graph are not in the runnable queue.  They will be moved to
+the runnable queue when they do not have any un-met dependencies.
+
 =item jobdone($job, $do_startmore, @exit_code)
 
 When jobs complete, they must call jobdone.  If C<$do_startmore> is true,
 then C<startmore()> will be called.  A true exit code signals an
 error and it is used by L<Proc::JobQueue::CommandQueue>.
+
+=item job_part_finished($job)
+
+This marks the C<$job> as complete and a new job can start in its place.
+For L<Proc::JobQueue::DependencyJob> jobs, this leaves the dependency
+in place.
 
 =item alldone
 
@@ -420,7 +583,7 @@ the queue is empty.
 =item status
 
 This prints a queue status to STDERR showing what's running on which hosts. 
-Printing is supressed unless $Proc::JobQueue::status_frequency seconds have
+Printing is supressed unless C<$Proc::JobQueue::status_frequency> seconds have
 passed since the last call to C<status()>.
 
 =item startmore
@@ -428,20 +591,33 @@ passed since the last call to C<status()>.
 This will start more jobs if possible.  The return value is true if there are 
 no more jobs to start.
 
+=item hold($new_value)
+
+Get (or set if $new_value is defined) the queue's hold-all-jobs parameter.
+If hold-all-jobs is true, no jobs will be started or pulled out of the
+dependency graph (if there is one).
+
+=back
+
+=head1 INTERNAL METHODS 
+
+These methods may be needed by subclassers or anyone poking around the
+internals:
+
+=over
+
+=item checkjobs
+
+Check L<Proc::Background> style jobs to see if any have finished.
+
 =item startjob($host, $jobnum, $job)
 
 This starts a single job.  It is used by startmore() and probably should not be
 used otherwise.
 
-=item checkjobs
+=item suicide
 
-This is used be L<Proc::JobQueue::BackgroundQueue>.
-
-=item hold($new_value)
-
-Get (or set if $new_value is defined) the queue's hold-all-jobs parameter.
-
-  $queue->jobdone($job, $do_startmore, @exit_code);
+Called to shut down.  Used by L<Proc::JobQueue::EventQueue>.
 
 =back
 
@@ -461,7 +637,10 @@ via explicit import:
 =head1 SEE ALSO
 
 L<Proc::JobQueue::Job>
-L<Proc::JobQueue::DependencyQueue>
+L<Proc::JobQueue::Command>
+L<Proc::JobQueue::DependencyJob>
+L<Proc::JobQueue::RemoteDependencyJob>
+L<Proc::JobQueue::EventQueue>
 L<Proc::JobQueue::BackgroundQueue>
 
 =head1 LICENSE

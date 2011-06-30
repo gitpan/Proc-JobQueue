@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Proc-JobQueue
-version:            0.602
+version:            0.901
 abstract:           Jobqueue with dependency graph
 author:
     - David Muir Sharnoff <muir@idiom.org>
@@ -19,7 +19,7 @@ requires:
     File::Temp:           0
     Hash::Util:           0
     List::MoreUtils:      0
-    Object::Dependency:   0
+    Object::Dependency:   0.32
     Proc::Background:     0
     RPC::ToWorker:        0.5
     Scalar::Util:         0
