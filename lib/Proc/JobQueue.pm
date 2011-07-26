@@ -13,7 +13,7 @@ use Module::Load;
 use Object::Dependency;
 require Exporter;
 
-our $VERSION = 0.901;
+our $VERSION = 0.902;
 our $debug ||= 0;
 our $status_frequency ||= 2;
 our $host_canonicalizer ||= 'File::Slurp::Remote::CanonicalHostnames';

@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Proc-JobQueue
-version:            0.901
+version:            0.902
 abstract:           Jobqueue with dependency graph
 author:
     - David Muir Sharnoff <muir@idiom.org>
