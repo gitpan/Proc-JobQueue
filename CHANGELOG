@@ -1,4 +1,8 @@
 
+=== 2012/03/03	0.903
+
+Bumping required version for File::Slurp::Remote
+
 === 2011/07/26  0.902
 
 Bugfix for RemoteDependencyJob.
